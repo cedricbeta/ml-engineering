@@ -118,7 +118,7 @@ readlink -f $(ldconfig -p | awk '$1=="libcuda.so.1" {print $NF; exit}')
 | Service | What it does | Needed on |
 | :------ | :----------- | :-------- |
 | `nvidia-persistenced` | keeps the driver initialized even when no process uses the GPUs. Without it, every new process pays several seconds of driver initialization, and some settings don't stick | all compute nodes |
-| `nvidia-fabricmanager` | configures the NVSwitches and the NVLink fabric between the GPUs | NVSwitch-based systems: HGX/DGX A100, H100, H200, B200, B300 |
+| `nvidia-fabricmanager` | configures the NVSwitches and the NVLink fabric between the GPUs; on B200/B300 systems it also starts the NVLink Subnet Manager (NVLSM) | NVSwitch-based systems: HGX/DGX A100, H100, H200, B200, B300 |
 | `nvidia-imex` | lets GPUs on different nodes share memory over NVLink | rack-scale multi-node NVLink systems (GB200/GB300 NVL72) |
 | DCGM (`nv-hostengine`) | GPU health checks, diagnostics and metrics | everywhere you want monitoring, see [Running diagnostics](../../compute/accelerator/nvidia/debug.md#running-diagnostics) |
 
@@ -129,7 +129,7 @@ systemctl status nvidia-fabricmanager    # on the host
 nvidia-smi -q | grep -A2 Fabric          # anywhere - wants: State: Completed, Status: Success
 ```
 
-On rack-scale NVL72 systems the NVLink domain spans many nodes and is managed from the NVLink switch trays, and the compute nodes run the IMEX service. On k8s this is orchestrated by NVIDIA's [DRA driver for GPUs](https://github.com/NVIDIA/k8s-dra-driver-gpu) via ComputeDomains.
+On rack-scale NVL72 systems the NVLink domain spans many nodes, Fabric Manager runs on the NVLink switch trays instead, and the compute nodes run the IMEX service - see [Multi-node NVLink systems](#multi-node-nvlink-systems-gb200gb300-nvl72).
 
 ## The three CUDA versions
 
@@ -242,6 +242,124 @@ You can tell it's working from NCCL's logs - the channels say `via NET/IB/.../GD
 
 For how the RDMA devices get into a pod, and how to verify the whole path, see [Fast Inter-node Networking](../kubernetes/network.md).
 
+## Multi-node NVLink systems (GB200/GB300 NVL72)
+
+Everything above applies to any NVIDIA GPU server. This section covers what's different on the rack-scale systems whose NVLink spans multiple machines - GB200 NVL72, GB300 NVL72 and GH200 NVL32 - known as multi-node NVLink (MNNVL). If you use the usual 8-GPU HGX/DGX servers (H100, H200, B200, B300), you can skip it.
+
+### B200 vs GB200
+
+B200 is a GPU. GB200 is a "superchip": a Grace CPU (NVIDIA's Arm CPU, the "G") plus 2 B200 GPUs. Likewise GB300 has B300 GPUs, and GH200 is a Grace CPU plus a Hopper GPU. The GPUs themselves are the same architecture (both need the open kernel modules, like all Blackwell GPUs) - the difference is how they are assembled into machines:
+
+| | HGX/DGX B200 | GB200 NVL72 |
+| :- | :----------- | :---------- |
+| unit | a server: 8 B200 GPUs + 2 x86 CPUs | a rack: 18 compute trays + 9 NVLink switch trays |
+| GPUs per machine (OS instance) | 8 | 4 per compute tray (2 GB200 = 2 Grace CPUs + 4 GPUs) |
+| NVLink domain | the 8 GPUs of one server | all 72 GPUs of the rack, across 18 machines |
+| between machines | NICs (InfiniBand/RoCE): the data is copied over the network | NVLink: GPUs read and write each other's memory directly |
+| CPU architecture | x86_64 | Arm (aarch64) - you need `arm64` images |
+| CPU-GPU link | PCIe | NVLink-C2C, with coherent memory (see [the coherent memory gotcha](../../debug/pytorch.md#overcoming-the-coherent-memory-uncertain-behavior)) |
+| fabric management | Fabric Manager and the NVLink Subnet Manager run on the server itself | Fabric Manager and the NVLink Subnet Manager run on the switch trays; IMEX runs on every compute tray |
+
+Practical consequences: the job specs need 4 GPUs per node (`--nproc-per-node=4`, `nvidia.com/gpu: 4`), the images must be built for `arm64` (see [CPU architecture](./ci.md#cpu-architecture)), and the cross-node NVLink needs the software described below.
+
+### Who does what
+
+- **On the NVLink switch trays** (they run NVIDIA's switch OS, NVOS): the NVLink Subnet Manager discovers the NVLink topology and programs the switches' forwarding tables, and Fabric Manager configures the switches into a single memory fabric among the GPUs. As a user you don't interact with these, but if they aren't healthy nothing below works.
+- **On every compute tray**: the GPU driver (open kernel modules), `nvidia-persistenced`, and the `nvidia-imex` daemon.
+- **In your process**: CUDA (`libcuda.so`) and the communication libraries - NCCL, NVSHMEM - which use the cross-node NVLink automatically when it's available.
+
+Each GPU reports its place in the fabric in the `Fabric` section of `nvidia-smi -q`, with the fields `State`, `Status`, `ClusterUUID` and `CliqueId`. `State: Completed` with `Status: Success` means the fabric has been set up for this GPU. GPUs with the same `ClusterUUID` are in the same NVLink domain, and GPUs with the same `CliqueId` within it can reach each other over NVLink - this is what NCCL uses to decide which ranks to connect via NVLink. On k8s, GPU Feature Discovery publishes it as the node label `nvidia.com/gpu.clique` (`<ClusterUUID>.<CliqueId>`).
+
+### How GPU memory is shared across machines
+
+Within one machine, processes share GPU memory through CUDA IPC handles, which are only meaningful to the driver of that machine. Across machines this can't work: the driver on node B knows nothing about an allocation on node A. MNNVL solves it with fabric handles and the IMEX service. The life of a buffer that a GPU on another node reads and writes:
+
+1. **Allocate** it with the CUDA virtual memory management API, requesting a fabric handle type: `cuMemCreate` with `CU_MEM_HANDLE_TYPE_FABRIC` (CUDA 12.4+; `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED` says whether the GPU supports it).
+2. **Export** it with `cuMemExportToShareableHandle`, which returns a fabric handle - a small blob of bytes. Unlike a file descriptor it isn't tied to a process or a machine, so it can be sent by any means.
+3. **Send** the bytes to the other process over a normal network connection - e.g., NCCL uses its TCP bootstrap connection, MPI programs use MPI.
+4. **Import** it on the other node with `cuMemImportFromShareableHandle`. The driver there asks its local IMEX daemon, which checks with the IMEX daemon of the exporting node that this import is allowed and obtains the information needed to map the memory.
+5. **Map** it into the process's address space (`cuMemMap`, `cuMemSetAccess`). From now on, kernels on node B read and write the memory on node A's GPU directly over NVLink - the data goes through the NVLink switches, not through the NICs or the CPUs.
+6. **Release** it on both sides (unmap and release the handles) when done.
+
+The IMEX daemons only exchange this bookkeeping, over TCP on the Ethernet network; the data itself always travels over NVLink.
+
+### IMEX: daemons, domains and channels
+
+- **The daemon** - `nvidia-imex` runs on every compute tray. The trays whose daemons know each other form an IMEX domain - the set of nodes that can share memory. On a manually configured system the peers are listed in `/etc/nvidia-imex/nodes_config.cfg`, one IP address per line, and the daemon's own settings are in `/etc/nvidia-imex/config.cfg`.
+- **The channels** - the device files `/dev/nvidia-caps-imex-channels/channelN`. A process can only export and import fabric memory if it has access to a channel, and 2 processes can only share memory if they use the same channel. This is how the memory of different users or jobs on the same NVLink domain is kept isolated - but only if each user or job gets exclusive access to its own channel (the driver uses the lowest-numbered channel the process can access). `channel0` can be created by the driver at load time with the `NVreg_CreateImexChannel0=1` module parameter (see [Module parameters](#module-parameters)), or manually with `mknod` - a single channel0 that everybody can access is the simple setup for a single-tenant system, and gives up that isolation.
+- **Single machines don't need any of it** - processes on the same machine share memory without IMEX.
+
+In containers, the channel device has to be passed in like the GPUs: with the NVIDIA Container Toolkit via `NVIDIA_IMEX_CHANNELS=0` (a comma-separated list of channel IDs). On k8s this is handled by NVIDIA's [DRA driver for GPUs](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu) (k8s 1.32+): you create a `ComputeDomain`, the driver runs the IMEX daemons for the nodes of your workload and creates a `ResourceClaimTemplate` for a channel, and your pods claim it:
+
+```yaml
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: my-compute-domain
+spec:
+  numNodes: 0
+  channel:
+    resourceClaimTemplate:
+      name: imex-channel-0
+```
+
+```yaml
+# in the pod spec of each worker
+spec:
+  containers:
+  - name: trainer
+    resources:
+      claims:
+      - name: imex-channel-0
+  resourceClaims:
+  - name: imex-channel-0
+    resourceClaimTemplateName: imex-channel-0
+```
+
+(`numNodes` is deprecated - `0` doesn't mean "no nodes", it's the recommended value in current versions of the driver.)
+
+A ComputeDomain follows the workload: it's created for it and goes away with it, and it isolates the workload's GPU memory from the other workloads on the same rack. The DRA driver's guide also adds a node affinity on the `nvidia.com/gpu.clique` label, so the pods only land on MNNVL nodes, and warns that a `Running` pod doesn't prove IMEX works - check that `/dev/nvidia-caps-imex-channels/channel0` exists inside it. See the DRA driver's [ComputeDomain guide](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/site/content/docs/guides/compute-domain-workloads.md).
+
+### How NCCL uses it
+
+`NCCL_MNNVL_ENABLE` controls it: `2` (the default) - check for MNNVL when the communicator spans more than one node, `1` - always check, `0` - never use it. When checking, NCCL:
+
+1. verifies that every rank's GPU supports fabric handles, that its fabric `State` is `Completed`, and that it reports a non-zero `ClusterUUID`,
+2. groups the ranks by `ClusterUUID` and `CliqueId` to find which ranks share an NVLink domain,
+3. runs a self-test within each process: allocates a small fabric buffer, exports it and imports it back (steps 1, 2 and 4 above). This verifies the process can use fabric memory, but as it never leaves the process, it can't catch a problem that only shows across nodes.
+
+If all of this works, the NCCL init logs show a line like:
+
+```
+NCCL INFO MNNVL 1 cliqueId 7f cliqueSize 8 cliqueRank 5 nvlDomainSize 8
+```
+
+where `cliqueSize` and `nvlDomainSize` count the ranks of this job, not the GPUs of the rack - a 2-tray test shows 8. From then on NCCL uses fabric memory for the buffers it shares with the ranks of the same clique, including the multicast objects of NVLink SHARP (NVLS).
+
+**Watch out for the silent fallback.** If any of the checks in step 1 fails on any rank - e.g., a single tray whose fabric state isn't `Completed` - NCCL quietly doesn't use MNNVL for the whole job and sends all the traffic between the trays over the NICs, with no error. (With the default value MNNVL is also skipped if P2P is disabled.) So always look for the `MNNVL 1` line. Only if those checks pass but the self-test fails does NCCL stop with an error:
+
+```
+MNNVL (cliqueSize 72) is available but not working on this system. Check the IMEX channel configuration (/dev/nvidia-caps-imex-channels). Set NCCL_MNNVL_ENABLE=0 to ignore this issue.
+```
+
+This message means fabric memory couldn't even be allocated - typically the process has no IMEX channel (e.g., the container didn't get one). A similar message that points to `nvidia-imex-ctl -N` means the local export or import failed - typically an IMEX daemon problem. `NCCL_MNNVL_ENABLE=0` gets the job running, but then the traffic between the compute trays goes over the NICs.
+
+### Verifying an MNNVL system
+
+```bash
+nvidia-smi -q | grep -A5 Fabric        # every GPU: State Completed, Status Success, the same ClusterUUID
+nvidia-smi nvlink --status             # every NVLink active at the expected speed
+systemctl status nvidia-imex           # on each compute tray (with the DRA driver: its daemon pods)
+nvidia-imex-ctl -N                     # the status of the whole IMEX domain
+ls -l /dev/nvidia-caps-imex-channels/  # inside the container/pod too
+```
+
+Then measure: [nvbandwidth](https://github.com/NVIDIA/nvbandwidth) has multi-node tests (e.g., `multinode_device_to_device_memcpy_read_ce`), or run [all_reduce_bench.py](../../network/benchmarks/all_reduce_bench.py) on 2 compute trays and compare with a single tray - with MNNVL working, crossing trays shouldn't cost the order of magnitude that crossing servers over NICs does.
+
+### MNNVL and process snapshots
+
+`cuda-checkpoint` can't checkpoint memory exported with `cuMemExportToShareableHandle`, which is exactly what fabric memory is. So to checkpoint a process that uses MNNVL - e.g., a multi-node training process - all its fabric allocations must be released first, typically by destroying the NCCL communicators, and re-created after the restore. See [Process checkpoint/restore](../kubernetes/snapshots.md#process-checkpointrestore).
+
 ## AMD GPUs
 
 The split is different from NVIDIA's: only the `amdgpu` kernel module is on the host (either the kernel's inbox version or the newer `amdgpu-dkms` from ROCm), and the entire ROCm user-space - including the parts that would correspond to `libcuda.so` - comes from the image. Nothing is injected; the container just needs the devices `/dev/kfd` and `/dev/dri/renderD*` (`--device=/dev/kfd --device=/dev/dri` with Docker, the [AMD GPU Operator](https://github.com/ROCm/gpu-operator) on k8s). The compatibility question is therefore between the host's `amdgpu` driver version and the image's ROCm version - check the ROCm compatibility matrix. See also [Troubleshooting AMD GPUs](../../compute/accelerator/amd/debug.md).
@@ -260,7 +378,7 @@ What must move together on an NVIDIA GPU node:
 
 1. the kernel modules and the driver user-space libraries - always the same version
 2. the GSP firmware - it comes with the driver package
-3. Fabric Manager (on NVSwitch systems) - the same version as the driver
+3. Fabric Manager (on NVSwitch servers) - a version compatible with the driver, in practice the same version since they are released together. On NVL72-class racks Fabric Manager runs on the switch trays instead, while the compute trays run `nvidia-imex`, which is packaged per driver branch and must be the same version on all the trays
 4. the CDI spec, if used - regenerated
 5. a reboot (or a full module reload) - until then the old kernel module keeps running
 
@@ -282,4 +400,6 @@ The container images don't need to be rebuilt after a driver upgrade (rule 2 of 
 | NCCL logs `NET/Socket` instead of `NET/IB` | no RDMA devices in the container | pod spec, see [network](../kubernetes/network.md) |
 | NCCL fails with `ibv_reg_mr` / `Cannot allocate memory` errors | the memlock limit isn't `unlimited` | host / container runtime |
 | NCCL works, but no `GDRDMA` in its logs | neither DMA-BUF nor `nvidia_peermem` is available | host |
+| a multi-node job on an NVL72-class rack is slow, and the NCCL logs have no `MNNVL 1` line | MNNVL was silently skipped - e.g., a GPU whose fabric `State` isn't `Completed`, so the traffic between trays goes over the NICs | `nvidia-smi -q` on every tray, see [How NCCL uses it](#how-nccl-uses-it) |
+| NCCL fails with `MNNVL ... is available but not working on this system` | on an NVL72-class system: no IMEX channel in the container, or an IMEX daemon problem | see [How NCCL uses it](#how-nccl-uses-it) |
 | GPU-related errors in `dmesg`, e.g., `Xid` | hardware or driver problems | see [Xid Errors](../../compute/accelerator/nvidia/debug.md#xid-errors) |

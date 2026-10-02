@@ -22,7 +22,7 @@ spec:
     command: ["sleep", "infinity"]
     resources:
       limits:
-        nvidia.com/gpu: 8
+        nvidia.com/gpu: 8  # GB200/GB300 NVL72: 4 GPUs per node (compute tray)
         memory: 512Gi
       requests:
         cpu: "64"

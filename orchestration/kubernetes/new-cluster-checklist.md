@@ -56,6 +56,8 @@ curl -sO https://raw.githubusercontent.com/stas00/ml-engineering/master/debug/to
 NCCL_DEBUG=INFO torchrun --nproc-per-node=8 torch-distributed-gpu-test.py
 ```
 
+(`--nproc-per-node` is the number of GPUs per node - 4 on GB200/GB300 NVL72.)
+
 Good: every rank reports OK. If it hangs, see [network debug](../../network/debug/).
 
 Then measure the GPUs' actual compute performance with [mamf-finder-all-gpus.py](../../compute/accelerator/benchmarks/mamf-finder-all-gpus.py): it runs [mamf-finder.py](../../compute/accelerator/benchmarks/mamf-finder.py)'s automatic search on GPU0, and then measures every other GPU while all the others compute too - the way a training job loads the node:
@@ -78,7 +80,7 @@ kubectl apply -f multi-node-job.yaml
 kubectl logs -l job-name=gpu-test --prefix --tail=-1 | grep -E "NET/|via NET"
 ```
 
-Good: `NET/IB` (or `NET/OFI` on AWS), one NIC per GPU listed, and `GDRDMA` in the channel lines. Bad: `NET/Socket` - the fast network isn't used. See [Fast Inter-node Networking](./network.md#2-does-nccl-use-them).
+Good: `NET/IB` (or `NET/OFI` on AWS), one NIC per GPU listed, and `GDRDMA` in the channel lines. Bad: `NET/Socket` - the fast network isn't used. See [Fast Inter-node Networking](./network.md#2-does-nccl-use-them). On GB200/GB300 NVL72 also look for the `MNNVL 1 ...` line, which shows that the NVLink between the nodes is used - without it NCCL has silently fallen back to the NICs, see [How NCCL uses it](../containers/drivers.md#how-nccl-uses-it).
 
 ## 4. Network bandwidth
 

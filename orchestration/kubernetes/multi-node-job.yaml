@@ -15,6 +15,10 @@
 #
 # Caveat: a plain Job doesn't restart the whole group if one pod dies - the other pods will just
 # hang in the collective until NCCL times out. For real training use JobSet or Kubeflow Trainer.
+#
+# On GB200/GB300 NVL72 (see ../containers/drivers.md#multi-node-nvlink-systems-gb200gb300-nvl72):
+# use 4 GPUs per node instead of 8, an arm64 image, and for the NVLink between nodes the pods also
+# need an IMEX channel (on k8s: a ComputeDomain claim)
 
 apiVersion: v1
 kind: Service
@@ -48,6 +52,7 @@ spec:
           set -ex
           curl -sO https://raw.githubusercontent.com/stas00/ml-engineering/master/debug/torch-distributed-gpu-test.py
           export NCCL_DEBUG=INFO
+          # --nproc-per-node must match the GPUs per node (4 on GB200/GB300 NVL72)
           # `exec` makes torchrun PID 1 so that it receives the SIGTERM when the pod is deleted,
           # see fault-tolerance.md
           exec torchrun \
@@ -61,7 +66,7 @@ spec:
         - containerPort: 29500
         resources:
           limits:
-            nvidia.com/gpu: 8
+            nvidia.com/gpu: 8  # GB200/GB300 NVL72: 4 GPUs per node (compute tray)
             # if your cluster has RDMA (IB/RoCE) exposed to pods, you also need to request it here,
             # the resource name is cluster-specific, e.g.: rdma/rdma_shared_device_a: 1
             # or on AWS EFA: vpc.amazonaws.com/efa: 32

@@ -17,6 +17,10 @@
 # - on pod deletion the `preStop` hook asks the training to save a checkpoint and waits for it to exit
 #
 # Adapt: image, number of nodes (in 3 places), PVC name, and the training command
+#
+# On GB200/GB300 NVL72 (see ../containers/drivers.md#multi-node-nvlink-systems-gb200gb300-nvl72):
+# use 4 GPUs per node instead of 8, an arm64 image, and for the NVLink between nodes the pods also
+# need an IMEX channel (on k8s: a ComputeDomain claim)
 
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -62,6 +66,7 @@ spec:
               args:
               - |
                 set -ex
+                # --nproc-per-node must match the GPUs per node (4 on GB200/GB300 NVL72)
                 # `exec` makes torchrun PID 1, so it gets the SIGTERM and forwards it to the workers
                 exec torchrun \
                   --nnodes=4 \
@@ -85,7 +90,7 @@ spec:
                     - touch /tmp/save-and-exit; while pgrep -f "[t]rain.py" > /dev/null; do sleep 5; done
               resources:
                 limits:
-                  nvidia.com/gpu: 8
+                  nvidia.com/gpu: 8  # GB200/GB300 NVL72: 4 GPUs per node (compute tray)
               securityContext:
                 capabilities:
                   add: ["IPC_LOCK", "SYS_PTRACE"]
