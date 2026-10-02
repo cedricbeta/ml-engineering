@@ -1,0 +1,82 @@
+# A minimal 2-node x 8-GPU torchrun job using only built-in k8s objects (Indexed Job + headless Service)
+#
+# It runs ../../debug/torch-distributed-gpu-test.py - always validate the cluster with it before a real run.
+#
+# usage:
+#   kubectl apply -f multi-node-job.yaml
+#   kubectl get pods -l job-name=gpu-test -w
+#   kubectl logs -l job-name=gpu-test --prefix --tail=-1
+#   kubectl delete -f multi-node-job.yaml
+#
+# How the nodes find each other:
+# - `completionMode: Indexed` gives each pod an index 0..N-1 in $JOB_COMPLETION_INDEX -> used as the node rank
+# - each pod's hostname becomes `<job-name>-<index>`, and with `subdomain` pointing at the headless
+#   Service of the same name, rank 0 is resolvable as `gpu-test-0.gpu-test`
+#
+# Caveat: a plain Job doesn't restart the whole group if one pod dies - the other pods will just
+# hang in the collective until NCCL times out. For real training use JobSet or Kubeflow Trainer.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-test
+spec:
+  clusterIP: None                 # headless - only used for DNS
+  publishNotReadyAddresses: true  # publish DNS records as soon as the pods exist
+  selector:
+    job-name: gpu-test
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-test
+spec:
+  completionMode: Indexed
+  completions: 2   # number of nodes
+  parallelism: 2   # must match completions - all nodes must run at the same time
+  backoffLimit: 0
+  template:
+    spec:
+      subdomain: gpu-test
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: nvcr.io/nvidia/pytorch:25.08-py3
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -ex
+          curl -sO https://raw.githubusercontent.com/stas00/ml-engineering/master/debug/torch-distributed-gpu-test.py
+          export NCCL_DEBUG=INFO
+          # `exec` makes torchrun PID 1 so that it receives the SIGTERM when the pod is deleted,
+          # see fault-tolerance.md
+          exec torchrun \
+            --nnodes=2 \
+            --nproc-per-node=8 \
+            --node-rank=$JOB_COMPLETION_INDEX \
+            --master-addr=gpu-test-0.gpu-test \
+            --master-port=29500 \
+            torch-distributed-gpu-test.py
+        ports:
+        - containerPort: 29500
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            # if your cluster has RDMA (IB/RoCE) exposed to pods, you also need to request it here,
+            # the resource name is cluster-specific, e.g.: rdma/rdma_shared_device_a: 1
+            # or on AWS EFA: vpc.amazonaws.com/efa: 32
+        securityContext:
+          capabilities:
+            add: ["IPC_LOCK"]  # RDMA needs to pin (lock) memory
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule

@@ -27,10 +27,21 @@ orchestration/slurm/users.md
 orchestration/slurm/performance.md
 orchestration/slurm/launchers/README.md
 orchestration/kubernetes/README.md
+orchestration/kubernetes/new-cluster-checklist.md
+orchestration/kubernetes/users.md
+orchestration/kubernetes/fault-tolerance.md
+orchestration/kubernetes/network.md
+orchestration/kubernetes/storage.md
+orchestration/kubernetes/inference.md
+orchestration/kubernetes/snapshots.md
+orchestration/containers/README.md
+orchestration/containers/drivers.md
+orchestration/containers/ci.md
 
 training/README.md
 training/model-parallelism/README.md
 training/performance/README.md
+training/performance/profiling.md
 training/fault-tolerance/README.md
 training/reproducibility/README.md
 training/instabilities/README.md

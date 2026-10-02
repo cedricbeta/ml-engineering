@@ -1,0 +1,89 @@
+# Build, smoke-test and push a training/inference image with GitHub Actions
+#
+# Copy to `.github/workflows/build-image.yml` in your repo and adapt `IMAGE` and the smoke test.
+# Everything here is explained in ci.md.
+#
+# Produces these tags:
+#   ghcr.io/my-org/train:<full git sha>   - immutable, use this one in your k8s/SLURM jobs
+#   ghcr.io/my-org/train:main             - moving tag pointing to the latest build of `main`
+#   ghcr.io/my-org/train:1.2.3            - when a `v1.2.3` git tag is pushed
+
+name: build-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  IMAGE: ghcr.io/my-org/train  # must be all lowercase
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  # to push to ghcr.io
+    steps:
+      - uses: actions/checkout@v7
+
+      # standard runners have only 14GB of free disk, which isn't enough for most ML images
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      # 1. build and load into the local docker daemon for testing - not pushed yet
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:test
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+
+      # 2. no GPUs here, but most breakages (missing/conflicting packages) are caught by imports
+      - name: Smoke test
+        run: |
+          docker run --rm ${{ env.IMAGE }}:test bash -c '
+            set -e
+            python -c "import torch, transformers; print(torch.__version__, torch.version.cuda)"
+            python -c "import train"   # your own code imports
+            pip check                  # remove if your base image already fails it
+          '
+
+      # 3. push - reuses the layers built in step 1, so it's fast
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max

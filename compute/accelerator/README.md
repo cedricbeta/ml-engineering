@@ -17,6 +17,7 @@ General:
 
 NVIDIA:
 - [Troubleshooting NVIDIA GPUs](nvidia/debug.md)
+- [Drivers: Kernel, Host and Container](../../orchestration/containers/drivers.md) - the driver stack, CUDA versions and how GPUs get into containers
 
 AMD:
 - [Troubleshooting AMD GPUs](amd/debug.md)

@@ -697,6 +697,9 @@ Finally, some vendors expose inference only as a hosted service on their own har
 
 ### How to choose an inference framework
 
+note: for how to deploy and operate an inference server on Kubernetes - health probes, rolling updates, multi-node replicas, cold start and autoscaling - see [Inference on Kubernetes](../orchestration/kubernetes/inference.md).
+
+
 To choose the most suitable inference framework you need to answer at least the following questions:
 
 1. Does the framework have the features that you need? Be careful here, some frameworks list that they support feature A, but when you try to use it, it's not well integrated or works really slowly.

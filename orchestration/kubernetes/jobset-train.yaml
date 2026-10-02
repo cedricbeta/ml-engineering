@@ -1,0 +1,108 @@
+# A fault-tolerant multi-node training job using JobSet (https://jobset.sigs.k8s.io/)
+#
+# Requires the JobSet controller to be installed in the cluster: `kubectl get crd jobsets.jobset.x-k8s.io`
+#
+# usage:
+#   kubectl apply -f jobset-train.yaml
+#   kubectl get jobset train                         # status and the number of restarts so far
+#   kubectl get pods -l jobset.sigs.k8s.io/jobset-name=train -o wide
+#   kubectl logs -l jobset.sigs.k8s.io/jobset-name=train --prefix -f --max-log-requests=64
+#   kubectl exec train-workers-0-0 -- touch /tmp/save-and-exit   # save a checkpoint and restart
+#   kubectl delete -f jobset-train.yaml
+#
+# What makes it fault tolerant (see fault-tolerance.md for the details):
+# - if any pod fails, JobSet re-creates all the pods (`failurePolicy`) and the training resumes from
+#   the last checkpoint on the persistent volume
+# - restarts caused by preemption/eviction don't count towards `maxRestarts`
+# - on pod deletion the `preStop` hook asks the training to save a checkpoint and waits for it to exit
+#
+# Adapt: image, number of nodes (in 3 places), PVC name, and the training command
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: train
+spec:
+  failurePolicy:
+    maxRestarts: 20
+    rules:
+    # a pod got preempted/evicted (the Job's podFailurePolicy below turned that into a
+    # `PodFailurePolicy` failure) - restart, but don't count it as a crash
+    - action: RestartJobSetAndIgnoreMaxRestarts
+      onJobFailureReasons:
+      - PodFailurePolicy
+      onJobFailureMessagePatterns:
+      - "has condition DisruptionTarget"
+    # everything else (a crash, a hardware failure) falls through to the default action
+    # `RestartJobSet`, which counts towards `maxRestarts`
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        completionMode: Indexed
+        parallelism: 4   # number of nodes
+        completions: 4   # number of nodes
+        backoffLimit: 0  # any pod failure fails the Job -> JobSet restarts all the pods together
+        podFailurePolicy:
+          rules:
+          - action: FailJob
+            onPodConditions:
+            - type: DisruptionTarget
+        template:
+          spec:
+            restartPolicy: Never
+            # how long k8s waits after the preStop hook started before SIGKILL-ing the container
+            # - must be longer than (finishing the current step + saving a checkpoint)
+            terminationGracePeriodSeconds: 900
+            containers:
+            - name: trainer
+              image: my-registry.example.com/my-team/train:2026-10-01
+              command: ["bash", "-c"]
+              args:
+              - |
+                set -ex
+                # `exec` makes torchrun PID 1, so it gets the SIGTERM and forwards it to the workers
+                exec torchrun \
+                  --nnodes=4 \
+                  --nproc-per-node=8 \
+                  --node-rank=$JOB_COMPLETION_INDEX \
+                  --master-addr=train-workers-0-0.train \
+                  --master-port=29500 \
+                  train.py --checkpoint-dir /checkpoints/my-run --resume latest
+              env:
+              - name: NCCL_DEBUG
+                value: WARN
+              lifecycle:
+                preStop:
+                  exec:
+                    # ask the training loop to save and exit, then wait until it does,
+                    # only then k8s sends SIGTERM
+                    command:
+                    - bash
+                    - -c
+                    # (`[t]rain.py` so that pgrep doesn't match this very command line)
+                    - touch /tmp/save-and-exit; while pgrep -f "[t]rain.py" > /dev/null; do sleep 5; done
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK", "SYS_PTRACE"]
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: checkpoints
+                mountPath: /checkpoints
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: checkpoints
+              persistentVolumeClaim:
+                claimName: my-shared-pvc  # must be ReadWriteMany - all nodes write to it
+            tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule

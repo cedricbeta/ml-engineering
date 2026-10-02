@@ -1,0 +1,53 @@
+# An interactive GPU pod - the k8s equivalent of SLURM's `salloc`
+#
+# usage:
+#   kubectl apply -f dev-pod.yaml
+#   kubectl wait --for=condition=Ready pod/dev-pod --timeout=30m
+#   kubectl exec -it dev-pod -- bash
+#   ... work ...
+#   kubectl delete -f dev-pod.yaml   # don't forget - the GPUs stay reserved until you do
+#
+# Adapt: image, GPU count, memory, and the PVC name (ask your admin which PVCs/storage classes exist)
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev-pod
+spec:
+  restartPolicy: Never
+  containers:
+  - name: dev
+    image: nvcr.io/nvidia/pytorch:25.08-py3
+    # keep the container alive so that you can `exec` into it
+    command: ["sleep", "infinity"]
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        memory: 512Gi
+      requests:
+        cpu: "64"
+        memory: 512Gi
+    securityContext:
+      capabilities:
+        # needed by py-spy/gdb to attach to a hanging process
+        add: ["SYS_PTRACE"]
+    volumeMounts:
+    - name: dshm
+      mountPath: /dev/shm
+    - name: data
+      mountPath: /data
+  volumes:
+  # the default /dev/shm is only 64MB, which breaks DataLoader workers and NCCL
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+  # persistent storage - anything written outside of it is lost when the pod is deleted
+  - name: data
+    persistentVolumeClaim:
+      claimName: my-shared-pvc
+  # many clusters taint GPU nodes so that non-GPU pods don't land on them
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule

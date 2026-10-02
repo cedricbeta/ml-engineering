@@ -4064,6 +4064,8 @@ For more options please refer to the [`torch.profiler` doc](https://docs.pytorch
 
 Additionally, here is [an excellent introduction to `torch.profiler` from the HuggingFace team](https://huggingface.co/blog/torch-profiler).
 
+To learn how to read the timeline traces produced by `torch.profiler` and Nsight Systems, and which patterns to look for, see [Reading Profiler Traces](../training/performance/profiling.md).
+
 #### When torch.profiler isn't enough
 
 In the introduction it was stated that cProfile is the wrong profiler for PyTorch code, however there are situations where you want to use cProfile with PyTorch code.

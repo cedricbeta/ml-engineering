@@ -2,6 +2,8 @@
 
 There are many container/accelerator orchestration solutions - many of which are open source.
 
+Since most orchestrators run your workloads inside containers, see also [Containers](containers/) - how to build, run and debug GPU container images, [Drivers: Kernel, Host and Container](containers/drivers.md), and [Building Images in CI](containers/ci.md).
+
 So far I have been working with SLURM and Kubernetes.
 
 ## SLURM
@@ -21,6 +23,9 @@ These are frameworks allowing you to run SLURM on top of Kubernetes:
 The other most popular orchestrator is Kubernetes:
 
 - [Kubernetes](kubernetes/) - also known as K8s, is an open source system for automating deployment, scaling, and management of containerized applications. Here is a good [comparison between SLURM and K8s](https://web.archive.org/web/20250324222116/https://www.fluidstack.io/post/is-kubernetes-or-slurm-the-best-orchestrator-for-512-gpu-jobs).
+- [Kubernetes for Users](kubernetes/users.md) - `kubectl` and pod spec essentials for ML work, multi-node training and diagnosing typical failures.
+- [Day One on a New Cluster](kubernetes/new-cluster-checklist.md) - verify a new cluster step by step.
+- [Fault Tolerance on Kubernetes](kubernetes/fault-tolerance.md), [Fast Inter-node Networking](kubernetes/network.md), [Data and Model Loading](kubernetes/storage.md), [Inference on Kubernetes](kubernetes/inference.md), [Snapshots](kubernetes/snapshots.md).
 
 ## Other orchestration frameworks
 

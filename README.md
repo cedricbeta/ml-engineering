@@ -1,5 +1,7 @@
 # Machine Learning Engineering Open Book
 
+> **About this fork:** this is a fork of Stas Bekman's [Machine Learning Engineering Open Book](https://github.com/stas00/ml-engineering), distributed under the same [CC BY-SA 4.0](LICENSE-CC-BY-SA) license. It adds chapters on [containers](orchestration/containers/) (including [drivers](orchestration/containers/drivers.md) and [building images in CI](orchestration/containers/ci.md)), [Kubernetes](orchestration/kubernetes/) (users guide, new-cluster checklist, fault tolerance, networking, storage, inference, snapshots) and [reading profiler traces](training/performance/profiling.md), plus Chinese summaries of these chapters ([中文要点索引](zh-notes.md)). The added material has not yet been validated on a real cluster. Everything else is the original book.
+
 This is an open collection of methodologies, tools and step by step instructions to help with successful training and fine-tuning of large language models and multi-modal models and their inference.
 
 This is a technical material suitable for LLM/VLM training engineers and operators. That is the content here contains lots of scripts and copy-n-paste commands to enable you to quickly address your needs.
@@ -33,6 +35,8 @@ I've been compiling this information mostly for myself so that I could quickly f
 
 1. **[Orchestration Systems](orchestration)** - managing containers and resources
 1. **[SLURM](orchestration/slurm)** - Simple Linux Utility for Resource Management
+1. **[Kubernetes](orchestration/kubernetes)** - working with k8s for ML workloads
+1. **[Containers](orchestration/containers)** - building, running and debugging GPU container images
 
 
 **Part 4. Training**

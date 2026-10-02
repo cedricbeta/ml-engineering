@@ -4,6 +4,8 @@ The faster you can make your model to train the sooner the model will finish tra
 
 In general maximizing throughput is all about running many experiments and measuring the outcome and choosing the one that is superior.
 
+To find out where the time actually goes, see [Reading Profiler Traces](./profiling.md) - how to use and read `torch.profiler`, Perfetto, Nsight Systems and Nsight Compute.
+
 In certain situations your modeling team may ask you to choose some hyper parameters that will be detrimental to throughput but overall beneficial for the overall model's success.
 
 

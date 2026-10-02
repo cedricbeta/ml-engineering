@@ -1,0 +1,128 @@
+# A vLLM inference server: Deployment + Service + PodDisruptionBudget
+#
+# Assumes the weights were already downloaded to a shared PVC, see storage.md#model-weights
+#
+# usage:
+#   kubectl apply -f vllm-deployment.yaml
+#   kubectl get pods -l app=llm -w                     # wait for READY 1/1 - loading can take many minutes
+#   kubectl port-forward svc/llm 8000:80
+#   curl localhost:8000/v1/models
+#   curl localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+#     -d '{"model": "llama-70b", "messages": [{"role": "user", "content": "Hello"}]}'
+#   kubectl delete -f vllm-deployment.yaml
+#
+# Every setting is explained in inference.md
+#
+# Adapt: image version, model path and name, TP size + GPU count, PVC name
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # with no spare GPUs a new pod can't start before an old one is gone - so replace one at a time
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: llm
+  template:
+    metadata:
+      labels:
+        app: llm
+    spec:
+      # time to finish the in-flight requests after SIGTERM
+      terminationGracePeriodSeconds: 120
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.28.0  # pin a version, never `latest`
+        command: ["vllm", "serve"]
+        args:
+        - /shared/models/Llama-3.1-70B-Instruct
+        - --served-model-name=llama-70b
+        - --tensor-parallel-size=4
+        - --port=8000
+        env:
+        - name: HF_HUB_OFFLINE  # never reach out to the HF hub - the weights are local
+          value: "1"
+        - name: VLLM_CACHE_ROOT  # keep torch.compile & co caches across restarts
+          value: /shared/cache/vllm
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          limits:
+            nvidia.com/gpu: 4  # must match --tensor-parallel-size
+        # until it succeeds, the liveness and readiness probes are not run - this is what
+        # protects the pod from being killed while it's loading the weights
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          failureThreshold: 180  # 180 x 10s = up to 30 minutes to start
+        # not ready -> removed from the Service, gets no traffic
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 3
+        # failing -> the container gets restarted
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 5      # the default 1s is too short for a server under heavy load
+          failureThreshold: 6
+        lifecycle:
+          preStop:
+            # give the Service/ingress time to stop sending new requests before SIGTERM
+            exec:
+              command: ["sleep", "15"]
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: shared
+          mountPath: /shared
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      - name: shared
+        persistentVolumeClaim:
+          claimName: my-shared-pvc
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm
+spec:
+  selector:
+    app: llm
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+---
+# let node drains and upgrades take down at most one replica at a time
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: llm
